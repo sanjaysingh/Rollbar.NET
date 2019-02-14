@@ -33,8 +33,9 @@ namespace Rollbar
 
         private readonly IRollbarConfig _config;
         private readonly PayloadQueue _payloadQueue;
-        private readonly ConcurrentDictionary<Task, Task> _pendingTasks = 
-            new ConcurrentDictionary<Task, Task>();
+        private readonly ConcurrentQueue<Action> _pendingTasks = new ConcurrentQueue<Action>();
+        private readonly ManualResetEvent _pendingTasksWaitEvent = new ManualResetEvent(false);
+        private readonly int _pendingTasksWorkersCount = 2;
 
         /// <summary>
         /// Occurs when a Rollbar internal event happens.
@@ -77,6 +78,9 @@ namespace Rollbar
                 );
             this._payloadQueue = new PayloadQueue(this, rollbarClient);
             RollbarQueueController.Instance.Register(this._payloadQueue);
+            
+            for (int i = 0; i < _pendingTasksWorkersCount; i++)
+                new Task(ProcessPendingTasks).Start();
         }
 
         /// <summary>
@@ -523,33 +527,43 @@ namespace Rollbar
             {
                 timeoutAt = DateTime.Now.Add(timeout.Value);
             }
+
             // we are taking here a fire-and-forget approach:
-            Task task = new Task(state => Enqueue(utcTimestamp, dataObject, level, custom, timeoutAt, signal), "EnqueueAsync");
-            if (!this._pendingTasks.TryAdd(task, task))
+            Action task = () => Enqueue(utcTimestamp, dataObject, level, custom, timeoutAt, signal);
+            lock (this._pendingTasks)
             {
-                this.OnRollbarEvent(new InternalErrorEventArgs(this, dataObject, null, "Couldn't add a pending task while performing EnqueueAsync(...)..."));
-                return Task.Factory.StartNew(() => { });
+                if (this.Config.ReportingQueueDepth == this._pendingTasks.Count)
+                {
+                    this._pendingTasks.TryDequeue(out var _);
+                }
+                this._pendingTasks.Enqueue(task);
+                this._pendingTasksWaitEvent.Set();
             }
-
-            task.ContinueWith(RemovePendingTask)
-                .ContinueWith(p => {
-                    OnRollbarEvent(new InternalErrorEventArgs(this, null, p.Exception, "While performing EnqueueAsync(...)..."));
-                    System.Diagnostics.Trace.TraceError(p.Exception.ToString());
-                    }, 
-                    TaskContinuationOptions.OnlyOnFaulted
-                    );
-            task.Start();
-
-            return task;
+            return Task.FromResult(true);
         }
 
-        private void RemovePendingTask(Task task)
+        private void ProcessPendingTasks()
         {
-            bool success = false;
-            do
+            while (!disposedValue)
             {
-                success = this._pendingTasks.TryRemove(task, out Task taskOut);
-            } while (!success);
+                this._pendingTasksWaitEvent.WaitOne();
+                if (this._pendingTasks.TryDequeue(out var task))
+                {
+                    try
+                    {
+                        task();
+                    }
+                    catch (System.Exception ex)
+                    {
+                        OnRollbarEvent(new InternalErrorEventArgs(this, null, ex, "While performing Enqueue(...)..."));
+                        System.Diagnostics.Trace.TraceError(ex.ToString());
+                    }
+                }
+                else
+                {
+                    this._pendingTasksWaitEvent.Reset();
+                }
+            }
         }
 
         private void Enqueue(
@@ -652,7 +666,6 @@ namespace Rollbar
                 if (disposing)
                 {
                     // TODO: dispose managed state (managed objects).
-                    Task.WaitAll(this._pendingTasks.Values.ToArray(), TimeSpan.FromMilliseconds(500));
                     this._payloadQueue.Release();
                 }
 
